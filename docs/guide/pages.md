@@ -92,7 +92,7 @@ class UsersController < ApplicationController
   def show
     user = User.find(params[:id])
 
-    render inertia: 'User/Show', props: { user: }
+    render inertia: 'User/Show', props: { user: user }
   end
 end
 ```
