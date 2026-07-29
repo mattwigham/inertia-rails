@@ -11,7 +11,7 @@ require_relative 'devtools/collector'
 require_relative 'devtools/entry_builder'
 require_relative 'devtools/entries_repository'
 require_relative 'devtools/recorder'
-require_relative 'devtools/exception_middleware'
+require_relative 'devtools/middleware'
 
 module InertiaRails
   module Devtools
@@ -60,19 +60,28 @@ module InertiaRails
         value.to_s.split(',').map(&:strip).reject(&:empty?)
       end
 
-      # The full body string when the body is safely bufferable, nil otherwise.
-      # Rails < 7.1's RackBody does not implement #to_ary; its #body returns the
-      # buffered string, but reading a Live streaming body would block, so those
-      # are excluded via the controller.
+      # #body and #to_ary read an already buffered body without draining it, but a
+      # file-backed or live streaming body would block. ActionDispatch::Response#body
+      # also hands back the raw stream when it is neither buffered nor #body-backed
+      # (`render stream:`), so only a String or Array is really a body.
       def buffered_body(env, body)
-        return body.to_ary.join if body.respond_to?(:to_ary)
-        return unless body.respond_to?(:body)
-        return if body.respond_to?(:to_path)
+        return if body.respond_to?(:to_path) || live_stream?(env)
 
-        controller = env['action_controller.instance']
-        return if defined?(ActionController::Live) && controller.is_a?(ActionController::Live)
+        parts = if body.respond_to?(:body)
+                  body.body
+                elsif body.respond_to?(:to_ary)
+                  body.to_ary
+                end
 
-        body.body.dup
+        case parts
+        when String then parts
+        when Array then parts.join
+        end
+      end
+
+      def live_stream?(env)
+        defined?(ActionController::Live) &&
+          env['action_controller.instance'].is_a?(ActionController::Live)
       end
 
       def swallow

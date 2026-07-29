@@ -81,6 +81,24 @@ RSpec.describe 'InertiaRails DevTools', type: :request do
         body.close
       end
 
+      it 'leaves a response carrying a validator alone' do
+        get devtools_cached_path
+
+        expect(response.headers['ETag']).to be_present
+        expect(response.body).not_to include('data-inertia-devtools-id')
+        expect(response.headers['X-Inertia-Devtools-Id']).to be_present
+      end
+
+      # What ActionDispatch::Response#body returns for `render stream:` on Rails 7.1+.
+      it 'does not mistake an unbuffered response stream for a body' do
+        stream = Object.new
+        stream.define_singleton_method(:each) { |&block| block.call('<html><body>real</body></html>') }
+        body = Object.new
+        body.define_singleton_method(:body) { stream }
+
+        expect(InertiaRails::Devtools.buffered_body({}, body)).to be_nil
+      end
+
       it 'skips configured path patterns without a leading slash' do
         InertiaRails.configuration.devtools_except = ['devtools_plain']
 
@@ -245,16 +263,28 @@ RSpec.describe 'InertiaRails DevTools', type: :request do
         expect(recorded['route']['actionSource']['file']).to end_with('inertia_devtools_test_controller.rb')
       end
 
+      it 'captures the page object as the response body' do
+        expect(recorded['http']['responseBody']['value']).to include('component' => 'DevtoolsComponent')
+      end
+    end
+
+    # The source is captured when the routes are drawn, so this needs a redraw with
+    # recording on — and another on the way out, or every later example sees the key.
+    describe 'routes drawn while recording' do
+      around do |example|
+        Rails.application.reload_routes!
+        example.run
+      ensure
+        InertiaRails.configuration.devtools = false
+        Rails.application.reload_routes!
+      end
+
       it 'links route-defined renders to the route definition' do
         get inertia_route_path, headers: { 'X-Inertia' => true }
         source = entry['renderSource']
 
         expect(source['file']).to end_with('config/routes.rb')
         expect(File.readlines(source['file'])[source['line'] - 1]).to include("inertia 'inertia_route'")
-      end
-
-      it 'captures the page object as the response body' do
-        expect(recorded['http']['responseBody']['value']).to include('component' => 'DevtoolsComponent')
       end
     end
 
@@ -303,6 +333,20 @@ RSpec.describe 'InertiaRails DevTools', type: :request do
       it 'redacts keys inside a captured non-Inertia response body' do
         get devtools_plain_path
         expect(entry['http']['responseBody']['value']).to eq('ok' => true, 'token' => '[REDACTED]')
+      end
+
+      it 'omits a non-Inertia response body it cannot redact by key' do
+        get non_inertiafied_path
+
+        expect(entry['http']['responseBody']).to eq('status' => 'omitted', 'reason' => 'unredactable')
+      end
+
+      it 'redacts the query of a full-page location redirect' do
+        get "#{devtools_props_path}?token=leaked",
+            headers: { 'X-Inertia' => true, 'X-Inertia-Version' => 'stale' }
+
+        expect(response.status).to eq 409
+        expect(entry['http']['responseHeaders']['x-inertia-location']).to include('token=%5BREDACTED%5D')
       end
 
       it 'honors the app filter_parameters list' do
@@ -395,7 +439,31 @@ RSpec.describe 'InertiaRails DevTools', type: :request do
     end
 
     describe 'the read API' do
+      # Outside development the API is gated, and the test environment is no exception.
+      around do |example|
+        InertiaRails.configuration.devtools_authorize = -> { true }
+        example.run
+      ensure
+        InertiaRails.configuration.devtools_authorize = nil
+      end
+
       before { get devtools_props_path }
+
+      it 'forbids the request when no gate is configured' do
+        InertiaRails.configuration.devtools_authorize = nil
+
+        get '/_inertia/devtools/entries'
+
+        expect(response.status).to eq 403
+      end
+
+      it 'forbids the request when the gate denies it' do
+        InertiaRails.configuration.devtools_authorize = -> { session[:admin] }
+
+        get '/_inertia/devtools/entries'
+
+        expect(response.status).to eq 403
+      end
 
       it 'lists entry metadata newest first' do
         get devtools_plain_path
@@ -430,6 +498,33 @@ RSpec.describe 'InertiaRails DevTools', type: :request do
         expect(response.parsed_body.length).to eq 1
       end
 
+      it 'keeps its own polling out of the log' do
+        logged = capture_log { get '/_inertia/devtools/entries' }
+
+        expect(response.status).to eq 200
+        expect(logged).to be_empty
+        expect(capture_log { get devtools_props_path }).to include('Started GET')
+      end
+
+      it 'logs the request when silencing is off' do
+        InertiaRails.configuration.devtools_silence_logs = false
+
+        logged = capture_log { get '/_inertia/devtools/entries' }
+
+        expect(logged).to include('EntriesController#index')
+      ensure
+        InertiaRails.configuration.devtools_silence_logs = true
+      end
+
+      it 'applies an offset' do
+        get devtools_plain_path
+
+        get '/_inertia/devtools/entries', params: { offset: 1 }
+
+        expect(response.parsed_body.length).to eq 1
+        expect(response.parsed_body.first['requestType']).to eq 'initial'
+      end
+
       it 'returns a single entry' do
         get "/_inertia/devtools/entries/#{entries.first['id']}"
 
@@ -457,6 +552,28 @@ RSpec.describe 'InertiaRails DevTools', type: :request do
         expect(entries.length).to eq 2
       ensure
         InertiaRails.configuration.devtools_limit = 100
+      end
+
+      it 'keeps only the newest entries that arrived without a tab' do
+        InertiaRails.configuration.devtools_limit = 2
+        3.times { get devtools_props_path }
+
+        expect(entries.length).to eq 2
+      ensure
+        InertiaRails.configuration.devtools_limit = 100
+      end
+
+      it 'stops touching storage after a write failure' do
+        repository = InertiaRails::Devtools::EntriesRepository.new(path: File.join(storage_path, 'nested'))
+        allow(FileUtils).to receive(:mkdir_p).and_raise(Errno::EACCES)
+        allow(InertiaRails::Devtools).to receive(:report)
+
+        3.times do
+          repository.record(InertiaRails::Devtools::Ulid.generate, {})
+          repository.prune_if_due
+        end
+
+        expect(InertiaRails::Devtools).to have_received(:report).once
       end
 
       it 'caps total entries even without a tab header' do

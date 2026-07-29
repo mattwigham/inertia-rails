@@ -46,8 +46,7 @@ module InertiaRails
 
           @suppressed_until = nil
         rescue StandardError => e
-          Devtools.report(e) if @suppressed_until.nil?
-          @suppressed_until = monotonic + SUPPRESS_SECONDS
+          suppress(e)
         end
       end
 
@@ -64,6 +63,7 @@ module InertiaRails
       end
 
       def prune_if_due
+        return if suppressed?
         return prune if @prune_interval <= 0
 
         ensure_directory
@@ -73,13 +73,18 @@ module InertiaRails
         prune
         write_atomically(File.join(@path, LAST_PRUNE_FILE), Time.now.to_i.to_s)
       rescue StandardError => e
-        Devtools.report(e)
+        suppress(e)
       end
 
       private
 
       def suppressed?
         @suppressed_until && monotonic < @suppressed_until
+      end
+
+      def suppress(error)
+        Devtools.report(error) if @suppressed_until.nil?
+        @suppressed_until = monotonic + SUPPRESS_SECONDS
       end
 
       def monotonic
@@ -112,7 +117,8 @@ module InertiaRails
       def evicted_ids(index, tab_uuid:, limit:, max_entries:)
         ids = []
 
-        if tab_uuid && limit.positive?
+        # A nil tab_uuid groups the tab-less entries rather than exempting them.
+        if limit.positive?
           tab_metas = index.values.select { |meta| meta['tabUuid'] == tab_uuid }
           ids |= newest_first(tab_metas).drop(limit).map { |meta| meta['id'] }
         end
@@ -138,10 +144,13 @@ module InertiaRails
         end
       end
 
+      # Rebuild from the index `mutate_index` already read under the lock: a snapshot
+      # taken outside it would clobber a concurrent write and orphan that entry file,
+      # which `prune` would then never reclaim.
       def rebuild_index_from_files
-        index = meta_from_files
-        mutate_index { index } unless index.empty?
-        index
+        rebuilt = {}
+        mutate_index { |index| rebuilt = normalize_index(index) }
+        rebuilt
       end
 
       def read_json(path)
